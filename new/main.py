@@ -139,47 +139,17 @@ class InferenceThread(threading.Thread):
                 continue
 
             try:
-                # 1. Store original frame resolution
-                h_orig, w_orig = frame.shape[:2]
-
-                # 2. Resize frame for faster detection/recognition
-                inference_frame = cv2.resize(
+                # 1. Run detection and recognition with hybrid downscaled/high-res pipeline
+                results = recognizer.recognize(
                     frame,
-                    (INFERENCE_WIDTH, INFERENCE_HEIGHT)
+                    inference_width=INFERENCE_WIDTH,
+                    inference_height=INFERENCE_HEIGHT
                 )
 
-                # 3. Perform face recognition on the resized frame
-                results = recognizer.recognize(inference_frame)
+                # 2. Update centroid tracker with the results (list of (bbox, name))
+                tracks = tracker.update(results)
 
-                # 4. Scale bounding box coordinates back to original size
-                scale_x = w_orig / INFERENCE_WIDTH
-                scale_y = h_orig / INFERENCE_HEIGHT
-
-                bboxes = []
-                for bbox, name in results:
-                    x1, y1, x2, y2 = bbox
-                    x1_scaled = int(x1 * scale_x)
-                    y1_scaled = int(y1 * scale_y)
-                    x2_scaled = int(x2 * scale_x)
-                    y2_scaled = int(y2 * scale_y)
-                    bboxes.append([x1_scaled, y1_scaled, x2_scaled, y2_scaled])
-
-                # 5. Update centroid tracker with scaled bounding boxes
-                tracks = tracker.update(bboxes)
-
-                # 6. Associate names from inference with active tracker items
-                for track_id, track in tracks.items():
-                    if track.disappeared > 0:
-                        continue
-                    # Match track.bbox with scaled bboxes to find the recognized name
-                    for bbox, (_, name) in zip(bboxes, results):
-                        if track.bbox == bbox:
-                            # Update name if valid name is recognized or name is currently unset
-                            if name != "Unknown" or track.name is None:
-                                track.name = name
-                            break
-
-                # 7. Update tracked results in shared state
+                # 3. Update tracked results in shared state
                 shared.set_tracks(list(tracks.values()))
                 shared.update_inference_fps()
 

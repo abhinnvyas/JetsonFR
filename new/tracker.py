@@ -31,8 +31,9 @@ class CentroidTracker:
         self.max_distance = max_distance
         self.tracks = OrderedDict()
 
-    def register(self, bbox):
+    def register(self, bbox, name=None):
         track = Track(self.next_track_id, bbox)
+        track.name = name
         self.tracks[self.next_track_id] = track
         self.next_track_id += 1
 
@@ -57,9 +58,9 @@ class CentroidTracker:
 
     def update(self, detections):
         """
-        detections = list of bounding boxes
+        detections = list of (bbox, name) tuples
         [
-            [x1,y1,x2,y2],
+            ([x1,y1,x2,y2], "Name"),
             ...
         ]
         """
@@ -81,14 +82,14 @@ class CentroidTracker:
 
         if len(self.tracks) == 0:
 
-            for bbox in detections:
-                self.register(bbox)
+            for bbox, name in detections:
+                self.register(bbox, name)
 
             return self.tracks
 
         detection_centroids = [
-            self._centroid(b)
-            for b in detections
+            self._centroid(bbox)
+            for bbox, name in detections
         ]
 
         used_tracks = set()
@@ -122,7 +123,11 @@ class CentroidTracker:
                 and best_distance < self.max_distance
             ):
 
-                track.bbox = detections[best_idx]
+                bbox, name = detections[best_idx]
+                track.bbox = bbox
+                # Update name if a valid identity was recognized, or if it is currently None
+                if name != "Unknown" or track.name is None:
+                    track.name = name
                 track.disappeared = 0
 
                 used_tracks.add(track_id)
@@ -142,9 +147,9 @@ class CentroidTracker:
         for track_id in remove:
             self.deregister(track_id)
 
-        for idx, bbox in enumerate(detections):
+        for idx, (bbox, name) in enumerate(detections):
 
             if idx not in used_detections:
-                self.register(bbox)
+                self.register(bbox, name)
 
         return self.tracks
