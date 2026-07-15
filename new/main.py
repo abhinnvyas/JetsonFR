@@ -9,6 +9,7 @@ from gi.repository import Gst
 
 from recognizer import FaceRecognizer
 from shared import SharedState
+from tracker import CentroidTracker
 from config import *
 
 
@@ -46,9 +47,10 @@ shared = SharedState()
 recognizer = FaceRecognizer()
 recognizer.load_database(FACE_DATABASE)
 
-
-latest_results = []
-result_lock = threading.Lock()
+tracker = CentroidTracker(
+    max_disappeared=TRACKER_MAX_DISAPPEARED,
+    max_distance=TRACKER_MAX_DISTANCE
+)
 
 
 # ----------------------------------------------------------
@@ -124,8 +126,6 @@ class InferenceThread(threading.Thread):
 
     def run(self):
 
-        global latest_results
-
         print("Inference thread started")
 
         while shared.is_running():
@@ -139,12 +139,48 @@ class InferenceThread(threading.Thread):
                 continue
 
             try:
+                # 1. Store original frame resolution
+                h_orig, w_orig = frame.shape[:2]
 
-                results = recognizer.recognize(frame)
+                # 2. Resize frame for faster detection/recognition
+                inference_frame = cv2.resize(
+                    frame,
+                    (INFERENCE_WIDTH, INFERENCE_HEIGHT)
+                )
 
-                with result_lock:
-                    latest_results = results
+                # 3. Perform face recognition on the resized frame
+                results = recognizer.recognize(inference_frame)
 
+                # 4. Scale bounding box coordinates back to original size
+                scale_x = w_orig / INFERENCE_WIDTH
+                scale_y = h_orig / INFERENCE_HEIGHT
+
+                bboxes = []
+                for bbox, name in results:
+                    x1, y1, x2, y2 = bbox
+                    x1_scaled = int(x1 * scale_x)
+                    y1_scaled = int(y1 * scale_y)
+                    x2_scaled = int(x2 * scale_x)
+                    y2_scaled = int(y2 * scale_y)
+                    bboxes.append([x1_scaled, y1_scaled, x2_scaled, y2_scaled])
+
+                # 5. Update centroid tracker with scaled bounding boxes
+                tracks = tracker.update(bboxes)
+
+                # 6. Associate names from inference with active tracker items
+                for track_id, track in tracks.items():
+                    if track.disappeared > 0:
+                        continue
+                    # Match track.bbox with scaled bboxes to find the recognized name
+                    for bbox, (_, name) in zip(bboxes, results):
+                        if track.bbox == bbox:
+                            # Update name if valid name is recognized or name is currently unset
+                            if name != "Unknown" or track.name is None:
+                                track.name = name
+                            break
+
+                # 7. Update tracked results in shared state
+                shared.set_tracks(list(tracks.values()))
                 shared.update_inference_fps()
 
             except Exception as e:
@@ -174,8 +210,6 @@ class DisplayThread(threading.Thread):
 
     def run(self):
 
-        global latest_results
-
         print("Display thread started")
 
         while shared.is_running():
@@ -188,13 +222,17 @@ class DisplayThread(threading.Thread):
                 time.sleep(0.005)
                 continue
 
-            with result_lock:
-                results = latest_results.copy()
+            # Retrieve active tracks from shared state
+            tracks = shared.get_tracks()
 
-            # Draw detections
-            for bbox, name in results:
+            # Draw tracked faces
+            for track in tracks:
+                # Skip inactive/disappeared tracks
+                if track.disappeared > 0:
+                    continue
 
-                x1, y1, x2, y2 = map(int, bbox)
+                x1, y1, x2, y2 = map(int, track.bbox)
+                display_name = f"{track.name or 'Unknown'} (ID: {track.id})"
 
                 if DRAW_BOXES:
                     cv2.rectangle(
@@ -208,7 +246,7 @@ class DisplayThread(threading.Thread):
                 if DRAW_NAMES:
                     cv2.putText(
                         frame,
-                        name,
+                        display_name,
                         (x1, max(20, y1 - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,

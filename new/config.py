@@ -25,3 +25,12 @@ DRAW_BOXES = True
 
 # Draw names
 DRAW_NAMES = True
+
+# Inference frame downscaling dimensions
+INFERENCE_WIDTH = 640
+INFERENCE_HEIGHT = 360
+
+# Centroid tracker configurations
+TRACKER_MAX_DISAPPEARED = 15
+TRACKER_MAX_DISTANCE = 100
+

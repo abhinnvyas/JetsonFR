@@ -15,6 +15,14 @@ class FaceRecognizer:
 
         self.app.prepare(ctx_id=0)
 
+        # Print active ONNX Runtime execution providers for debugging performance
+        print("[FaceRecognizer] Active execution providers for loaded models:")
+        for model_name, model in self.app.models.items():
+            if hasattr(model, 'session'):
+                print(f"  - Model '{model_name}': {model.session.get_providers()}")
+            else:
+                print(f"  - Model '{model_name}': Session not available")
+
         self.known_embeddings = []
         self.known_names = []
 
