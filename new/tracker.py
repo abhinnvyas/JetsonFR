@@ -9,6 +9,7 @@ class Track:
         self.disappeared = 0
         self.name = None
         self.recognized = False
+        self.unknown_count = 0
 
     @property
     def centroid(self):
@@ -34,6 +35,7 @@ class CentroidTracker:
     def register(self, bbox, name=None):
         track = Track(self.next_track_id, bbox)
         track.name = name
+        track.unknown_count = 0
         self.tracks[self.next_track_id] = track
         self.next_track_id += 1
 
@@ -125,10 +127,19 @@ class CentroidTracker:
 
                 bbox, name = detections[best_idx]
                 track.bbox = bbox
-                # Update name if a valid identity was recognized, or if it is currently None
-                if name != "Unknown" or track.name is None:
-                    track.name = name
                 track.disappeared = 0
+
+                # Name update logic with leak protection & flicker prevention
+                if name != "Unknown":
+                    track.name = name
+                    track.unknown_count = 0
+                else:
+                    if track.name is not None and track.name != "Unknown":
+                        track.unknown_count += 1
+                        if track.unknown_count > 5:
+                            track.name = "Unknown"
+                    else:
+                        track.name = "Unknown"
 
                 used_tracks.add(track_id)
                 used_detections.add(best_idx)

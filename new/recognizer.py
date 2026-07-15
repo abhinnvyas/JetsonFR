@@ -44,7 +44,7 @@ class FaceRecognizer:
             if len(faces) == 0:
                 continue
 
-            embedding = faces[0].embedding
+            embedding = faces[0].normed_embedding
 
             self.known_embeddings.append(embedding)
 
@@ -98,7 +98,7 @@ class FaceRecognizer:
                 model.get(frame, face)
 
             # 6. Perform similarity matching against known embeddings
-            embedding = face.embedding
+            embedding = face.normed_embedding
 
             if len(self.known_embeddings) == 0:
                 name = "Unknown"
@@ -106,6 +106,9 @@ class FaceRecognizer:
                 scores = np.dot(self.known_embeddings, embedding)
                 idx = np.argmax(scores)
                 score = scores[idx]
+
+                # Diagnostic print to check actual similarity scores
+                print(f"[FaceRecognizer] Match score with '{self.known_names[idx]}': {score:.4f} (threshold: {SIMILARITY_THRESHOLD})")
 
                 if score > SIMILARITY_THRESHOLD:
                     name = self.known_names[idx]
