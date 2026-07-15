@@ -27,6 +27,7 @@ class SharedState:
 
         self.latest_frame = None
         self.latest_tracks = []
+        self.track_version = 0
 
         self.frame_id = 0
         self.running = True
@@ -83,6 +84,7 @@ class SharedState:
 
         with self.track_lock:
             self.latest_tracks = copy.deepcopy(tracks)
+            self.track_version += 1
 
     def get_tracks(self):
         """
@@ -91,6 +93,14 @@ class SharedState:
 
         with self.track_lock:
             return copy.deepcopy(self.latest_tracks)
+
+    def get_tracks_with_version(self):
+        """
+        Returns a safe copy of tracks along with the current version.
+        """
+
+        with self.track_lock:
+            return copy.deepcopy(self.latest_tracks), self.track_version
 
     # ---------------------------------------------------
     # FPS counters

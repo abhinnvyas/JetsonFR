@@ -9,7 +9,7 @@ from gi.repository import Gst
 
 from recognizer import FaceRecognizer
 from shared import SharedState
-from tracker import CentroidTracker
+from tracker import CentroidTracker, TemplateTracker
 from config import *
 
 
@@ -177,6 +177,8 @@ class DisplayThread(threading.Thread):
         super().__init__(daemon=True)
 
         self.frame_interval = 1.0 / DISPLAY_FPS
+        self.trackers = {}
+        self.last_track_version = -1
 
     def run(self):
 
@@ -192,12 +194,38 @@ class DisplayThread(threading.Thread):
                 time.sleep(0.005)
                 continue
 
-            # Retrieve active tracks from shared state
-            tracks = shared.get_tracks()
+            # Retrieve active tracks along with their version
+            tracks, track_version = shared.get_tracks_with_version()
+
+            if track_version != self.last_track_version:
+                # 1. Inference thread updated tracks: initialize/correct template trackers
+                active_ids = set()
+                for track in tracks:
+                    if track.disappeared > 0:
+                        continue
+                    active_ids.add(track.id)
+                    # Initialize or re-template the tracker with fresh inference bbox coordinates
+                    self.trackers[track.id] = TemplateTracker(frame, track.bbox)
+                
+                # Cleanup trackers for inactive track IDs
+                for tid in list(self.trackers.keys()):
+                    if tid not in active_ids:
+                        self.trackers.pop(tid, None)
+                
+                self.last_track_version = track_version
+            else:
+                # 2. In between inference updates: track faces using cv2.matchTemplate at 30 FPS
+                for track in tracks:
+                    if track.disappeared > 0:
+                        continue
+                    t_tracker = self.trackers.get(track.id)
+                    if t_tracker is not None:
+                        success, bbox = t_tracker.update(frame)
+                        if success:
+                            track.bbox = bbox
 
             # Draw tracked faces
             for track in tracks:
-                # Skip inactive/disappeared tracks
                 if track.disappeared > 0:
                     continue
 

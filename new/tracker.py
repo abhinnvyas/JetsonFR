@@ -1,4 +1,5 @@
 import math
+import cv2
 from collections import OrderedDict
 
 
@@ -164,3 +165,56 @@ class CentroidTracker:
                 self.register(bbox, name)
 
         return self.tracks
+
+
+class TemplateTracker:
+    def __init__(self, frame, bbox, padding=40):
+        """
+        bbox is [x1, y1, x2, y2]
+        """
+        x1, y1, x2, y2 = map(int, bbox)
+        h, w = frame.shape[:2]
+        
+        # Crop template with boundary protection
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w, x2))
+        y2 = max(0, min(h, y2))
+        
+        self.template = frame[y1:y2, x1:x2].copy()
+        self.bbox = [x1, y1, x2, y2]
+        self.padding = padding
+
+    def update(self, frame):
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, self.bbox)
+        tw = x2 - x1
+        th = y2 - y1
+        
+        if tw <= 0 or th <= 0 or self.template.size == 0:
+            return False, self.bbox
+
+        # Define search region around the last known position
+        sx1 = max(0, x1 - self.padding)
+        sy1 = max(0, y1 - self.padding)
+        sx2 = min(w, x2 + self.padding)
+        sy2 = min(h, y2 + self.padding)
+        
+        search_region = frame[sy1:sy2, sx1:sx2]
+        
+        # Search region must be larger than or equal to template size
+        if search_region.shape[0] < th or search_region.shape[1] < tw:
+            return False, self.bbox
+            
+        # Run template matching
+        res = cv2.matchTemplate(search_region, self.template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        
+        if max_val > 0.55:  # Similarity threshold
+            # Update bbox position
+            new_x1 = sx1 + max_loc[0]
+            new_y1 = sy1 + max_loc[1]
+            self.bbox = [new_x1, new_y1, new_x1 + tw, new_y1 + th]
+            return True, self.bbox
+        else:
+            return False, self.bbox
