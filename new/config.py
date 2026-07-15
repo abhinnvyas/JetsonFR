@@ -1,4 +1,8 @@
-RTSP_URL = "rtsp://admin:123456Ai@192.168.1.69:554/snl/live/1/1"
+RTSP_URLS = [
+    "rtsp://admin:123456Ai@192.168.1.69:554/snl/live/1/1",
+    # You can add more RTSP stream URLs here, e.g.:
+    # "rtsp://admin:123456Ai@192.168.1.70:554/snl/live/1/1",
+]
 
 FACE_DATABASE = "faces"
 

@@ -20,24 +20,6 @@ from config import *
 Gst.init(None)
 
 
-PIPELINE = (
-    f'rtspsrc location="{RTSP_URL}" latency={RTSP_LATENCY} ! '
-    "rtph264depay ! "
-    "h264parse ! "
-    "nvv4l2decoder ! "
-    "nvvidconv ! "
-    "video/x-raw,format=BGRx ! "
-    "videoconvert ! "
-    "video/x-raw,format=BGR ! "
-    "appsink "
-    "name=sink "
-    "emit-signals=true "
-    "max-buffers=1 "
-    "drop=true "
-    "sync=false"
-)
-
-
 # ----------------------------------------------------------
 # Shared Objects
 # ----------------------------------------------------------
@@ -47,11 +29,6 @@ shared = SharedState()
 recognizer = FaceRecognizer()
 recognizer.load_database(FACE_DATABASE)
 
-tracker = CentroidTracker(
-    max_disappeared=TRACKER_MAX_DISAPPEARED,
-    max_distance=TRACKER_MAX_DISTANCE
-)
-
 
 # ----------------------------------------------------------
 # Capture Thread
@@ -59,20 +36,41 @@ tracker = CentroidTracker(
 
 class CaptureThread(threading.Thread):
 
-    def __init__(self):
+    def __init__(self, camera_id, rtsp_url):
 
         super().__init__(daemon=True)
 
-        self.pipeline = Gst.parse_launch(PIPELINE)
+        self.camera_id = camera_id
 
-        self.appsink = self.pipeline.get_by_name("sink")
+        # Low-latency GStreamer pipeline string with leaky queues and appsink dropping
+        self.pipeline_str = (
+            f'rtspsrc location="{rtsp_url}" latency={RTSP_LATENCY} drop-on-latency=true ! '
+            "queue max-size-buffers=1 leaky=downstream ! "
+            "rtph264depay ! "
+            "h264parse ! "
+            "nvv4l2decoder ! "
+            "nvvidconv ! "
+            "video/x-raw,format=BGRx ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            "videoconvert ! "
+            "video/x-raw,format=BGR ! "
+            "appsink "
+            f"name=sink_{camera_id} "
+            "emit-signals=true "
+            "max-buffers=1 "
+            "drop=true "
+            "sync=false"
+        )
+
+        self.pipeline = Gst.parse_launch(self.pipeline_str)
+        self.appsink = self.pipeline.get_by_name(f"sink_{camera_id}")
 
         if self.appsink is None:
-            raise RuntimeError("Could not create appsink")
+            raise RuntimeError(f"Could not create appsink for camera {camera_id}")
 
     def run(self):
 
-        print("Starting GStreamer pipeline...")
+        print(f"Starting GStreamer pipeline for camera {self.camera_id}...")
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -99,18 +97,17 @@ class CaptureThread(threading.Thread):
                 dtype=np.uint8
             ).copy()
 
-            frame = frame.reshape(
-                (height, width, 3)
-            )
+            frame = frame.reshape((height, width, 3))
 
             buffer.unmap(map_info)
 
-            shared.set_frame(frame)
-            shared.update_capture_fps()
+            shared.set_frame(self.camera_id, frame)
+            shared.update_capture_fps(self.camera_id)
 
-        print("Stopping Capture Thread...")
+        print(f"Stopping Capture Thread for camera {self.camera_id}...")
 
         self.pipeline.set_state(Gst.State.NULL)
+
 
 # ----------------------------------------------------------
 # Inference Thread
@@ -118,11 +115,21 @@ class CaptureThread(threading.Thread):
 
 class InferenceThread(threading.Thread):
 
-    def __init__(self):
+    def __init__(self, camera_ids):
 
         super().__init__(daemon=True)
 
+        self.camera_ids = camera_ids
         self.frame_interval = 1.0 / INFERENCE_FPS
+
+        # A separate CentroidTracker instance for each camera stream
+        self.trackers = {
+            cam_id: CentroidTracker(
+                max_disappeared=TRACKER_MAX_DISAPPEARED,
+                max_distance=TRACKER_MAX_DISTANCE
+            )
+            for cam_id in camera_ids
+        }
 
     def run(self):
 
@@ -132,30 +139,33 @@ class InferenceThread(threading.Thread):
 
             start_time = time.time()
 
-            frame = shared.get_frame()
+            # Cycle round-robin through all configured camera streams
+            for camera_id in self.camera_ids:
 
-            if frame is None:
-                time.sleep(0.005)
-                continue
+                frame = shared.get_frame(camera_id)
 
-            try:
-                # 1. Run detection and recognition with hybrid downscaled/high-res pipeline
-                results = recognizer.recognize(
-                    frame,
-                    inference_width=INFERENCE_WIDTH,
-                    inference_height=INFERENCE_HEIGHT
-                )
+                if frame is None:
+                    continue
 
-                # 2. Update centroid tracker with the results (list of (bbox, name))
-                tracks = tracker.update(results)
+                try:
+                    # Run detection and recognition with hybrid downscaled/high-res pipeline
+                    results = recognizer.recognize(
+                        frame,
+                        inference_width=INFERENCE_WIDTH,
+                        inference_height=INFERENCE_HEIGHT
+                    )
 
-                # 3. Update tracked results in shared state
-                shared.set_tracks(list(tracks.values()))
-                shared.update_inference_fps()
+                    # Update this camera's centroid tracker
+                    tracks = self.trackers[camera_id].update(results)
 
-            except Exception as e:
+                    # Store results in the shared state
+                    shared.set_tracks(camera_id, list(tracks.values()))
 
-                print(f"Inference error: {e}")
+                except Exception as e:
+
+                    print(f"Inference error on camera {camera_id}: {e}")
+
+            shared.update_inference_fps()
 
             elapsed = time.time() - start_time
 
@@ -166,19 +176,23 @@ class InferenceThread(threading.Thread):
 
         print("Inference thread stopped")
 
+
 # ----------------------------------------------------------
 # Display Thread
 # ----------------------------------------------------------
 
 class DisplayThread(threading.Thread):
 
-    def __init__(self):
+    def __init__(self, camera_ids):
 
         super().__init__(daemon=True)
 
+        self.camera_ids = camera_ids
         self.frame_interval = 1.0 / DISPLAY_FPS
-        self.trackers = {}
-        self.last_track_version = -1
+
+        # Dictionary of trackers and tracking versions per camera stream
+        self.template_trackers = {cam_id: {} for cam_id in camera_ids}
+        self.last_track_versions = {cam_id: -1 for cam_id in camera_ids}
 
     def run(self):
 
@@ -188,106 +202,107 @@ class DisplayThread(threading.Thread):
 
             start_time = time.time()
 
-            frame = shared.get_frame()
+            # 1. Grab latest frames from all camera feeds
+            active_frames = {}
+            for camera_id in self.camera_ids:
+                frame = shared.get_frame(camera_id)
+                if frame is not None:
+                    active_frames[camera_id] = frame
 
-            if frame is None:
+            if len(active_frames) == 0:
                 time.sleep(0.005)
                 continue
 
-            # Retrieve active tracks along with their version
-            tracks, track_version = shared.get_tracks_with_version()
+            # 2. Update tracking and draw overlays on each active feed
+            for camera_id, frame in active_frames.items():
 
-            if track_version != self.last_track_version:
-                # 1. Inference thread updated tracks: initialize/correct template trackers
-                active_ids = set()
+                tracks, track_version = shared.get_tracks_with_version(camera_id)
+
+                if track_version != self.last_track_versions[camera_id]:
+                    # Fresh inference tracks available: correct/initialize template trackers
+                    active_ids = set()
+                    for track in tracks:
+                        if track.disappeared > 0:
+                            continue
+                        active_ids.add(track.id)
+                        self.template_trackers[camera_id][track.id] = TemplateTracker(frame, track.bbox)
+
+                    # Remove stale template trackers
+                    for tid in list(self.template_trackers[camera_id].keys()):
+                        if tid not in active_ids:
+                            self.template_trackers[camera_id].pop(tid, None)
+
+                    self.last_track_versions[camera_id] = track_version
+
+                else:
+                    # In-between inference frames: update TemplateTrackers at 30 FPS
+                    for track in tracks:
+                        if track.disappeared > 0:
+                            continue
+                        t_tracker = self.template_trackers[camera_id].get(track.id)
+                        if t_tracker is not None:
+                            success, bbox = t_tracker.update(frame)
+                            if success:
+                                track.bbox = bbox
+
+                # Draw bounding boxes and name labels on this frame
                 for track in tracks:
                     if track.disappeared > 0:
                         continue
-                    active_ids.add(track.id)
-                    # Initialize or re-template the tracker with fresh inference bbox coordinates
-                    self.trackers[track.id] = TemplateTracker(frame, track.bbox)
-                
-                # Cleanup trackers for inactive track IDs
-                for tid in list(self.trackers.keys()):
-                    if tid not in active_ids:
-                        self.trackers.pop(tid, None)
-                
-                self.last_track_version = track_version
-            else:
-                # 2. In between inference updates: track faces using cv2.matchTemplate at 30 FPS
-                for track in tracks:
-                    if track.disappeared > 0:
-                        continue
-                    t_tracker = self.trackers.get(track.id)
-                    if t_tracker is not None:
-                        success, bbox = t_tracker.update(frame)
-                        if success:
-                            track.bbox = bbox
 
-            # Draw tracked faces
-            for track in tracks:
-                if track.disappeared > 0:
-                    continue
+                    x1, y1, x2, y2 = map(int, track.bbox)
+                    display_name = f"{track.name or 'Unknown'} (ID: {track.id})"
 
-                x1, y1, x2, y2 = map(int, track.bbox)
-                display_name = f"{track.name or 'Unknown'} (ID: {track.id})"
+                    if DRAW_BOXES:
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (0, 255, 0),
+                            2
+                        )
 
-                if DRAW_BOXES:
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1),
-                        (x2, y2),
-                        (0, 255, 0),
-                        2
-                    )
+                    if DRAW_NAMES:
+                        cv2.putText(
+                            frame,
+                            display_name,
+                            (x1, max(20, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2
+                        )
 
-                if DRAW_NAMES:
+                # Render camera performance statistics
+                if SHOW_FPS:
+                    cap_fps = shared.capture_fps.get(camera_id, 0.0)
                     cv2.putText(
                         frame,
-                        display_name,
-                        (x1, max(20, y1 - 10)),
+                        f"Cam {camera_id} Cap: {cap_fps:.1f}",
+                        (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
+                        0.6,
+                        (255, 255, 0),
+                        2
+                    )
+                    cv2.putText(
+                        frame,
+                        f"Inf: {shared.inference_fps:.1f} | Disp: {shared.display_fps:.1f}",
+                        (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 0),
                         2
                     )
 
-            if SHOW_FPS:
+            # 3. Create and show a grid layout combining all active streams
+            grid_frame = self.create_grid(active_frames)
 
-                cv2.putText(
-                    frame,
-                    f"Capture : {shared.capture_fps:.1f}",
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2
+            if grid_frame is not None:
+                cv2.imshow(
+                    WINDOW_NAME,
+                    grid_frame
                 )
-
-                cv2.putText(
-                    frame,
-                    f"Inference : {shared.inference_fps:.1f}",
-                    (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Display : {shared.display_fps:.1f}",
-                    (10, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2
-                )
-
-            cv2.imshow(
-                WINDOW_NAME,
-                frame
-            )
 
             shared.update_display_fps()
 
@@ -308,6 +323,36 @@ class DisplayThread(threading.Thread):
 
         print("Display thread stopped")
 
+    def create_grid(self, frames):
+        """
+        Resize and combine multiple camera frames into a single grid frame.
+        Supports 1, 2, 3, or 4 camera feeds.
+        """
+        num_cameras = len(frames)
+        if num_cameras == 0:
+            return None
+        if num_cameras == 1:
+            return list(frames.values())[0]
+
+        # Target dimensions for each grid element
+        gw, gh = 640, 360
+        resized_frames = []
+        for cam_id in sorted(frames.keys()):
+            resized = cv2.resize(frames[cam_id], (gw, gh))
+            resized_frames.append(resized)
+
+        if num_cameras == 2:
+            return np.hstack(resized_frames)
+
+        # Pad layout to 4 cells for 3-camera feeds
+        while len(resized_frames) < 4:
+            resized_frames.append(np.zeros((gh, gw, 3), dtype=np.uint8))
+
+        top_row = np.hstack(resized_frames[:2])
+        bottom_row = np.hstack(resized_frames[2:])
+        return np.vstack([top_row, bottom_row])
+
+
 # ----------------------------------------------------------
 # Main
 # ----------------------------------------------------------
@@ -315,43 +360,52 @@ class DisplayThread(threading.Thread):
 def main():
 
     print("=" * 60)
-    print("Jetson Face Recognition")
+    print("Jetson Multi-Camera Face Recognition")
     print("=" * 60)
 
-    capture_thread = CaptureThread()
-    inference_thread = InferenceThread()
-    display_thread = DisplayThread()
+    # Resolve camera indices from the config file RTSP_URLS list
+    camera_ids = list(range(len(RTSP_URLS)))
 
-    capture_thread.start()
+    # Instantiate and start capture thread for each camera
+    capture_threads = []
+    for camera_id, rtsp_url in enumerate(RTSP_URLS):
+        cap_thread = CaptureThread(camera_id, rtsp_url)
+        capture_threads.append(cap_thread)
+        cap_thread.start()
 
-    # Wait until the first frame arrives
-    while shared.get_frame() is None:
+    # Block until at least one frame is captured from any feed
+    print("Waiting for camera feeds to initialize...")
+    initialized = False
+    while not initialized and shared.is_running():
+        for camera_id in camera_ids:
+            if shared.get_frame(camera_id) is not None:
+                initialized = True
+                break
         time.sleep(0.05)
+
+    # Launch inference and window display threads
+    inference_thread = InferenceThread(camera_ids)
+    display_thread = DisplayThread(camera_ids)
 
     inference_thread.start()
     display_thread.start()
 
     try:
-
         while shared.is_running():
             time.sleep(0.5)
 
     except KeyboardInterrupt:
-
         print("\nStopping...")
-
         shared.stop()
 
     finally:
-
-        capture_thread.join(timeout=2)
+        for cap_thread in capture_threads:
+            cap_thread.join(timeout=2)
 
         inference_thread.join(timeout=2)
-
         display_thread.join(timeout=2)
 
         cv2.destroyAllWindows()
-
         print("Shutdown complete.")
 
 

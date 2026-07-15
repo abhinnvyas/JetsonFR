@@ -5,19 +5,7 @@ import copy
 
 class SharedState:
     """
-    Thread-safe shared data between:
-
-    Capture Thread
-            ↓
-      latest_frame
-
-    Inference Thread
-            ↓
-      latest_tracks
-
-    Display Thread
-            ↓
-       frame + tracks
+    Thread-safe shared data between multi-camera pipeline threads.
     """
 
     def __init__(self):
@@ -25,18 +13,20 @@ class SharedState:
         self.frame_lock = threading.Lock()
         self.track_lock = threading.Lock()
 
-        self.latest_frame = None
-        self.latest_tracks = []
-        self.track_version = 0
+        # Multi-camera state dictionaries (camera_id -> data)
+        self.frames = {}
+        self.tracks = {}
+        self.track_versions = {}
+        self.frame_ids = {}
 
-        self.frame_id = 0
         self.running = True
 
-        self.capture_fps = 0.0
+        # FPS trackers
+        self.capture_fps = {}
+        self.last_capture_times = {}
         self.inference_fps = 0.0
         self.display_fps = 0.0
 
-        self.last_capture_time = time.time()
         self.last_inference_time = time.time()
         self.last_display_time = time.time()
 
@@ -44,99 +34,76 @@ class SharedState:
     # Frame functions
     # ---------------------------------------------------
 
-    def set_frame(self, frame):
+    def set_frame(self, camera_id, frame):
         """
-        Called only by the capture thread.
-
-        Always overwrite the previous frame so inference
-        never builds up latency.
+        Called by the capture thread of each camera.
         """
-
         with self.frame_lock:
-            self.latest_frame = frame
-            self.frame_id += 1
+            self.frames[camera_id] = frame
+            self.frame_ids[camera_id] = self.frame_ids.get(camera_id, 0) + 1
 
-    def get_frame(self):
+    def get_frame(self, camera_id):
         """
         Called by inference and display threads.
-
-        Returns a COPY to avoid concurrent modification.
         """
-
         with self.frame_lock:
-
-            if self.latest_frame is None:
+            frame = self.frames.get(camera_id)
+            if frame is None:
                 return None
-
-            return self.latest_frame.copy()
+            return frame.copy()
 
     # ---------------------------------------------------
     # Tracking results
     # ---------------------------------------------------
 
-    def set_tracks(self, tracks):
+    def set_tracks(self, camera_id, tracks):
         """
-        Store latest tracking results.
-
-        tracks is expected to be:
-        list(track_objects)
+        Store latest tracking results for a specific camera.
         """
-
         with self.track_lock:
-            self.latest_tracks = copy.deepcopy(tracks)
-            self.track_version += 1
+            self.tracks[camera_id] = copy.deepcopy(tracks)
+            self.track_versions[camera_id] = self.track_versions.get(camera_id, 0) + 1
 
-    def get_tracks(self):
+    def get_tracks(self, camera_id):
         """
-        Returns a safe copy of tracks.
+        Returns a safe copy of tracks for a specific camera.
         """
-
         with self.track_lock:
-            return copy.deepcopy(self.latest_tracks)
+            return copy.deepcopy(self.tracks.get(camera_id, []))
 
-    def get_tracks_with_version(self):
+    def get_tracks_with_version(self, camera_id):
         """
-        Returns a safe copy of tracks along with the current version.
+        Returns a safe copy of tracks along with the version for a specific camera.
         """
-
         with self.track_lock:
-            return copy.deepcopy(self.latest_tracks), self.track_version
+            tracks = copy.deepcopy(self.tracks.get(camera_id, []))
+            version = self.track_versions.get(camera_id, 0)
+            return tracks, version
 
     # ---------------------------------------------------
     # FPS counters
     # ---------------------------------------------------
 
-    def update_capture_fps(self):
-
+    def update_capture_fps(self, camera_id):
         now = time.time()
-
-        dt = now - self.last_capture_time
-
+        last_time = self.last_capture_times.get(camera_id, now)
+        dt = now - last_time
         if dt > 0:
-            self.capture_fps = 1.0 / dt
-
-        self.last_capture_time = now
+            self.capture_fps[camera_id] = 1.0 / dt
+        self.last_capture_times[camera_id] = now
 
     def update_inference_fps(self):
-
         now = time.time()
-
         dt = now - self.last_inference_time
-
         if dt > 0:
             self.inference_fps = 1.0 / dt
-
         self.last_inference_time = now
 
     def update_display_fps(self):
-
         now = time.time()
-
         dt = now - self.last_display_time
-
         if dt > 0:
             self.display_fps = 1.0 / dt
-
         self.last_display_time = now
 
     # ---------------------------------------------------
