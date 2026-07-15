@@ -1,0 +1,5 @@
+RTSP_URL = "rtsp://admin:123456Ai@192.168.1.69:554/snl/live/1/1"
+
+SIMILARITY_THRESHOLD = 0.45
+
+FACE_DATABASE = "faces"
